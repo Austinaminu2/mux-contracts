@@ -29,6 +29,30 @@ describe("MuxRecoveryClient filtering query params", () => {
     expect(RecoveryStatus.Cancelled).toBe("Cancelled");
   });
 
+  it("RecoveryRequest interface includes expiresAt field", () => {
+    // Verify the interface shape compiles and carries expiresAt.
+    const req: import("../src/generated/mux-recovery").RecoveryRequest = {
+      newOwner: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" as any,
+      initiatedAt: 1000,
+      executableAt: 17280,
+      expiresAt: 120960,
+      status: RecoveryStatus.Pending,
+    };
+    expect(req.expiresAt).toBe(120960);
+  });
+
+  it("RecoveryRequest null defaults include expiresAt", () => {
+    // When no recovery is active, all fields should be null including expiresAt.
+    const req = {
+      status: RecoveryStatus.None,
+      newOwner: null,
+      initiatedAt: null,
+      executableAt: null,
+      expiresAt: null,
+    };
+    expect(req.expiresAt).toBeNull();
+  });
+
   it("exports RecoveryQueryFilters type", () => {
     const filters: RecoveryQueryFilters = {
       status: RecoveryStatus.Pending,

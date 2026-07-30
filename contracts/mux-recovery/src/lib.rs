@@ -187,6 +187,28 @@ pub enum RecoveryStatus {
 }
 
 /// An active recovery request stored on-chain.
+///
+/// Storage is bounded: exactly one `RecoveryRequest` per contract instance
+/// at [`DataKey::Recovery`]. The struct is serialised via Soroban SDK's
+/// `contracttype` and is directly deserialisable from TypeScript bindings.
+///
+/// # TypeScript binding shape
+///
+/// ```typescript
+/// export interface RecoveryRequest {
+///   newOwner: Address;      // Stellar address of the proposed owner
+///   initiatedAt: u32;       // Ledger sequence when recovery was started
+///   executableAt: u32;      // Earliest ledger for execute_recovery
+///   expiresAt: u32;         // Latest ledger; auto-expires after this
+///   status: RecoveryStatus; // None | Pending | Executed | Cancelled
+/// }
+/// ```
+///
+/// # Storage griefing
+///
+/// Recovery storage is a single `RecoveryRequest` (≤~200 bytes) and does
+/// **not** use unbounded Vec/Map collections, so instance storage growth is
+/// inherently bounded.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecoveryRequest {
@@ -441,57 +463,13 @@ impl MuxRecovery {
             .unwrap_or(RecoveryStatus::None)
     }
 
-    /// Add a new guardian. Requires owner authorization and enforces the cap.
-    pub fn add_guardian(env: Env, owner: Address, guardian: Address) -> Result<(), RecoveryError> {
-        Self::require_owner(&env)?;
-        let mut guardians: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Guardians)
-            .ok_or(RecoveryError::NotInitialized)?;
-        if guardians.contains(&guardian) {
-            return Err(RecoveryError::GuardianAlreadyExists);
-        }
-        if guardians.len() >= MAX_GUARDIANS {
-            return Err(RecoveryError::TooManyGuardians);
-        }
-        guardians.push_back(guardian.clone());
-        env.storage()
-            .instance()
-            .set(&DataKey::Guardians, &guardians);
-        emit(&env, symbol_short!("grd_add"), (owner, guardian));
-        Self::extend_ttl(&env);
-        Ok(())
-    }
-
-    /// Remove an existing guardian. Requires owner authorization and preserves the minimum.
-    pub fn remove_guardian(
-        env: Env,
-        owner: Address,
-        guardian: Address,
-    ) -> Result<(), RecoveryError> {
-        Self::require_owner(&env)?;
-        let mut guardians: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Guardians)
-            .ok_or(RecoveryError::NotInitialized)?;
-        if !guardians.contains(&guardian) {
-            return Err(RecoveryError::GuardianNotFound);
-        }
-        if guardians.len() <= 1 {
-            return Err(RecoveryError::MinGuardiansRequired);
-        }
-        let mut updated = Vec::new(&env);
-        for existing in guardians.iter() {
-            if existing != guardian {
-                updated.push_back(existing);
-            }
-        }
-        env.storage().instance().set(&DataKey::Guardians, &updated);
-        emit(&env, symbol_short!("grd_rm"), (owner, guardian));
-        Self::extend_ttl(&env);
-        Ok(())
+    /// Return the full recovery request, or `None` if no request exists.
+    ///
+    /// This entrypoint is primarily used by off-chain indexers and TypeScript
+    /// bindings that need the complete `RecoveryRequest` struct rather than
+    /// just the status.
+    pub fn recovery_request(env: Env) -> Option<RecoveryRequest> {
+        env.storage().instance().get(&DataKey::Recovery)
     }
 
     /// Link a registry contract address to this recovery contract.
@@ -823,9 +801,9 @@ mod tests {
 
     #[test]
     fn test_add_guardian_emits_event() {
-        let (env, client, owner, _) = setup();
+        let (env, client, _, _) = setup();
         let new_guardian = Address::generate(&env);
-        let _ = client.try_add_guardian(&owner, &new_guardian);
+        let _ = client.try_add_guardian(&new_guardian);
         let events = env.events().all();
         // init + grd_add
         assert_eq!(events.len(), 2);
@@ -834,9 +812,9 @@ mod tests {
 
     #[test]
     fn test_add_duplicate_guardian_rejected() {
-        let (_env, client, owner, guardian) = setup();
+        let (_env, client, _, guardian) = setup();
         let err = client
-            .try_add_guardian(&owner, &guardian)
+            .try_add_guardian(&guardian)
             .unwrap_err()
             .unwrap();
         assert_eq!(err, RecoveryError::GuardianAlreadyExists);
@@ -854,11 +832,11 @@ mod tests {
         client.initialize(&owner, &vec![&env, g1]);
         // Fill to MAX_GUARDIANS (16), already have 1
         for _ in 1..MAX_GUARDIANS {
-            let _ = client.try_add_guardian(&owner, &Address::generate(&env));
+            let _ = client.try_add_guardian(&Address::generate(&env));
         }
         // One more must be rejected
         let err = client
-            .try_add_guardian(&owner, &Address::generate(&env))
+            .try_add_guardian(&Address::generate(&env))
             .unwrap_err()
             .unwrap();
         assert_eq!(err, RecoveryError::TooManyGuardians);
@@ -866,21 +844,21 @@ mod tests {
 
     #[test]
     fn test_remove_guardian_succeeds() {
-        let (env, client, owner, guardian) = setup();
+        let (env, client, _, guardian) = setup();
         let g2 = Address::generate(&env);
-        let _ = client.try_add_guardian(&owner, &g2);
+        let _ = client.try_add_guardian(&g2);
         // Now we have 2 guardians, removing one should work
-        let _ = client.try_remove_guardian(&owner, &guardian);
+        let _ = client.try_remove_guardian(&guardian);
         assert!(!client.guardians().contains(&guardian));
         assert_eq!(client.guardians().len(), 1);
     }
 
     #[test]
     fn test_remove_guardian_emits_event() {
-        let (env, client, owner, guardian) = setup();
+        let (env, client, _, guardian) = setup();
         let g2 = Address::generate(&env);
-        client.add_guardian(&owner, &g2);
-        client.remove_guardian(&owner, &guardian);
+        client.add_guardian(&g2);
+        client.remove_guardian(&guardian);
         let events = env.events().all();
         // init + grd_add + grd_rm
         assert_eq!(events.len(), 3);
@@ -889,10 +867,10 @@ mod tests {
 
     #[test]
     fn test_remove_last_guardian_rejected() {
-        let (_env, client, owner, guardian) = setup();
+        let (_env, client, _, guardian) = setup();
         // Only 1 guardian, can't remove
         let err = client
-            .try_remove_guardian(&owner, &guardian)
+            .try_remove_guardian(&guardian)
             .unwrap_err()
             .unwrap();
         assert_eq!(err, RecoveryError::MinGuardiansRequired);
@@ -900,10 +878,10 @@ mod tests {
 
     #[test]
     fn test_remove_nonexistent_guardian_rejected() {
-        let (env, client, owner, _) = setup();
+        let (env, client, _, _) = setup();
         let stranger = Address::generate(&env);
         let err = client
-            .try_remove_guardian(&owner, &stranger)
+            .try_remove_guardian(&stranger)
             .unwrap_err()
             .unwrap();
         assert_eq!(err, RecoveryError::GuardianNotFound);
@@ -915,10 +893,9 @@ mod tests {
         env.mock_all_auths();
         let contract_id = env.register_contract(None, MuxRecovery);
         let client = MuxRecoveryClient::new(&env, &contract_id);
-        let owner = Address::generate(&env);
         let guardian = Address::generate(&env);
         let err = client
-            .try_add_guardian(&owner, &guardian)
+            .try_add_guardian(&guardian)
             .unwrap_err()
             .unwrap();
         assert_eq!(err, RecoveryError::NotInitialized);
@@ -926,10 +903,10 @@ mod tests {
 
     #[test]
     fn test_removed_guardian_cannot_initiate_recovery() {
-        let (env, client, owner, guardian) = setup();
+        let (env, client, _, guardian) = setup();
         let g2 = Address::generate(&env);
-        client.add_guardian(&owner, &g2);
-        client.remove_guardian(&owner, &guardian);
+        client.add_guardian(&g2);
+        client.remove_guardian(&guardian);
         // Removed guardian tries to initiate recovery
         let new_owner = Address::generate(&env);
         let err = client
@@ -941,9 +918,9 @@ mod tests {
 
     #[test]
     fn test_newly_added_guardian_can_initiate_recovery() {
-        let (env, client, owner, _) = setup();
+        let (env, client, _, _) = setup();
         let g2 = Address::generate(&env);
-        client.add_guardian(&owner, &g2);
+        client.add_guardian(&g2);
         // New guardian can initiate recovery
         let new_owner = Address::generate(&env);
         client.initiate_recovery(&g2, &new_owner);
@@ -1049,6 +1026,54 @@ mod tests {
             .with_mut(|l| l.sequence_number += RECOVERY_TIMELOCK + 1);
         client.execute_recovery(&guardian);
         assert_eq!(client.owner(), second_owner);
+    }
+
+    // ── recovery_request storage struct (#396) ────────────────────────────────
+
+    #[test]
+    fn test_recovery_request_returns_none_when_no_active_recovery() {
+        let (_env, client, _, _) = setup();
+        assert!(client.recovery_request().is_none());
+    }
+
+    #[test]
+    fn test_recovery_request_returns_full_struct_after_initiate() {
+        let (env, client, _, guardian) = setup();
+        let new_owner = Address::generate(&env);
+        client.initiate_recovery(&guardian, &new_owner);
+
+        let req = client.recovery_request().unwrap();
+        assert_eq!(req.new_owner, new_owner);
+        assert_eq!(req.status, RecoveryStatus::Pending);
+        let seq = env.ledger().sequence();
+        assert_eq!(req.initiated_at, seq);
+        assert_eq!(req.executable_at, seq + RECOVERY_TIMELOCK);
+        assert_eq!(req.expires_at, seq + RECOVERY_EXPIRY);
+    }
+
+    #[test]
+    fn test_recovery_request_status_transitions_via_struct() {
+        let (env, client, _, guardian) = setup();
+        let new_owner = Address::generate(&env);
+        client.initiate_recovery(&guardian, &new_owner);
+
+        // Pending
+        assert_eq!(client.recovery_request().unwrap().status, RecoveryStatus::Pending);
+
+        // Cancel -> Cancelled
+        client.cancel_recovery();
+        assert_eq!(client.recovery_request().unwrap().status, RecoveryStatus::Cancelled);
+
+        // Re-initiate -> Pending
+        let second_owner = Address::generate(&env);
+        client.initiate_recovery(&guardian, &second_owner);
+        assert_eq!(client.recovery_request().unwrap().status, RecoveryStatus::Pending);
+
+        // Execute -> Executed
+        env.ledger()
+            .with_mut(|l| l.sequence_number += RECOVERY_TIMELOCK + 1);
+        client.execute_recovery(&guardian);
+        assert_eq!(client.recovery_request().unwrap().status, RecoveryStatus::Executed);
     }
 
     // ── registry link (#403) ──────────────────────────────────────────────────

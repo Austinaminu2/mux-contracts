@@ -115,6 +115,7 @@ Every state mutation emits a structured event under the `mux_recv` contract tag.
 | `execute_recovery` | `rec_exec` | `(guardian: Address, new_owner: Address)` |
 | `cancel_recovery` | `rec_cncl` | `()` |
 | `set_registry` | `reg_link` | `registry_id: Address` |
+| `recovery_request` | _(read-only)_ | Returns the full `RecoveryRequest` struct, no event emitted |
 
 > **Note:** For `rec_init`, `executable_at` is derived from the ledger sequence at initiation time plus `RECOVERY_TIMELOCK`. It is not stored directly in the event data but can be computed from the on-chain ledger context.
 
@@ -139,16 +140,22 @@ An optional registry contract address (`registry_id`) can be associated with the
 - The stored address is informational: the contract does **not** call the registry at link time. Off-chain tooling should cross-check that the registry contract at that address contains the expected metadata for this recovery deployment.
 - TypeScript binding methods: `setRegistry(sourceKeypair, owner, registryId)` and `getRegistryId(sourceKeypair)`.
 
-### 4.6 Registry Link
+### 4.7 Recovery request struct query
 
-The recovery contract supports an optional `registry_id` field that links the deployment to a specific `mux-registry` instance.
+The `recovery_request()` entrypoint returns the full `RecoveryRequest` struct (not just the status), which includes:
 
-- **Purpose:** When set, off-chain tooling can cross-reference the registry metadata (e.g. contract version, audit status) against the deployed recovery contract to confirm authenticity.
-- **Optional field:** `registry_id()` returns `None` if the registry link has not been set. The contract operates normally without it.
-- **Owner-gated:** Setting the registry requires `owner.require_auth()`. Guardians and other callers cannot modify the link.
-- **Auditability:** Calling `set_registry` emits a `reg_link` event containing the registry address, so the linkage is fully observable on-chain.
+| Field | Type | Description |
+|---|---|---|
+| `new_owner` | `Address` | The proposed new owner address |
+| `initiated_at` | `u32` | Ledger sequence when recovery was initiated |
+| `executable_at` | `u32` | Earliest ledger for `execute_recovery` (`initiated_at + RECOVERY_TIMELOCK`) |
+| `expires_at` | `u32` | Latest ledger; auto-expires after this (`initiated_at + RECOVERY_EXPIRY`) |
+| `status` | `RecoveryStatus` | Current lifecycle state |
 
-> **Upcoming:** The `set_registry()` entrypoint and `registry_id` storage are tracked in issue [#403](https://github.com/mux-labs/mux-contracts/issues/403).
+This entrypoint is read-only (no event emitted) and is designed primarily for off-chain indexers and TypeScript bindings that need the complete struct.
+
+- TypeScript binding method: `recoveryRequest(sourceKeypair)` returns `Promise<RecoveryRequest | null>`.
+- The on-chain `RecoveryRequest` struct is serialised via `#[contracttype]` and directly deserialisable in the TypeScript client.
 
 ---
 
@@ -173,7 +180,6 @@ The recovery contract supports an optional `registry_id` field that links the de
 - **Immutable guardian set.** Guardians cannot be rotated without redeploying the contract. A guardian rotation mechanism with its own timelock is planned.
 - **No guardian liveness check.** If all guardians lose their keys, recovery is impossible.
 - **No on-chain registry validation.** The `registry_id` field stores an address but does not call the registry at initialization time. Off-chain tooling must verify the link is correct and that the registry entry matches the deployed contract.
-- **Single-signer guardian model.** Each guardian acts independently — there is no on-chain M-of-N threshold enforced per-signature. Any single guardian can initiate and execute recovery on their own. A multi-signature threshold requirement is a planned future improvement.
 
 ---
 

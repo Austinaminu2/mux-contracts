@@ -156,6 +156,7 @@ export interface RecoveryRequest {
   newOwner: Address;
   initiatedAt: number;
   executableAt: number;
+  expiresAt: number;
   status: RecoveryStatus;
 }
 
@@ -305,6 +306,21 @@ export class MuxRecoveryClient {
   }
 
   /**
+   * Return the full recovery request struct, or null if no active request exists.
+   * Mirrors the on-chain `recovery_request()` entrypoint.
+   */
+  async recoveryRequest(
+    sourceKeypair: Keypair
+  ): Promise<RecoveryRequest | null> {
+    const tx = await this.buildTx(sourceKeypair, "recovery_request", []);
+    const result = await this.simulate<string | null>(tx);
+    if (result === null || result === undefined) return null;
+    // The simulate returns an xdr.ScVal; parse it into RecoveryRequest
+    const parsed = scValToNative(result as any) as RecoveryRequest;
+    return parsed;
+  }
+
+  /**
    * Convenience method: returns true only if the recovery status matches
    * the given filter value (or any if filter is omitted).
    */
@@ -334,13 +350,14 @@ export class MuxRecoveryClient {
     newOwner: Address | null;
     initiatedAt: number | null;
     executableAt: number | null;
+    expiresAt: number | null;
   } | null> {
     const status = await this.recoveryStatus(sourceKeypair);
 
     if (status === RecoveryStatus.None) {
       return filters?.status !== undefined && filters.status !== RecoveryStatus.None
         ? null
-        : { status, newOwner: null, initiatedAt: null, executableAt: null };
+        : { status, newOwner: null, initiatedAt: null, executableAt: null, expiresAt: null };
     }
 
     // Fetch full state via simulate
@@ -353,6 +370,7 @@ export class MuxRecoveryClient {
       newOwner: null, // full RecoveryRequest requires contract extension
       initiatedAt: null,
       executableAt: null,
+      expiresAt: null,
     };
   }
 
