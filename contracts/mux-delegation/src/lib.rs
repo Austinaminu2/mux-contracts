@@ -71,7 +71,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    Symbol, Vec,
 };
 
 // ── Audit events ──────────────────────────────────────────────────────────────
@@ -103,6 +104,10 @@ pub enum DataKey {
     /// Stores the on-chain Address of this delegation contract instance
     /// for registry discoverability (see `link_contract_id`).
     ContractId,
+    /// Upgrade authority, set once by `initialize`. Independent of the
+    /// caller-supplied `admin` parameter accepted by `link_contract_id` —
+    /// see `docs/delegation-upgrade.md` for why the two are not unified.
+    Admin,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -121,6 +126,10 @@ pub enum MuxDelegationError {
     TooManyDelegates = 6004,
     /// A contract address has already been linked; `link_contract_id` is write-once.
     ContractIdAlreadySet = 6005,
+    /// `upgrade` was called before `initialize` — there is no admin to authorise it.
+    NotInitialized = 6006,
+    /// `initialize` was called more than once.
+    AlreadyInitialized = 6007,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -130,6 +139,38 @@ pub struct MuxDelegation;
 
 #[contractimpl]
 impl MuxDelegation {
+    /// Initialize the contract with an upgrade admin. Optional: a delegation
+    /// contract that is never initialized behaves exactly as before this
+    /// admin was introduced — `grant_delegate` / `revoke_delegate` /
+    /// `link_contract_id` are unaffected. Only `upgrade()` requires this to
+    /// have been called first.
+    pub fn initialize(env: Env, admin: Address) -> Result<(), MuxDelegationError> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(MuxDelegationError::AlreadyInitialized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        emit(&env, symbol_short!("init"), admin);
+        Self::extend_ttl(&env);
+        Ok(())
+    }
+
+    /// Upgrade the contract WASM. Admin only.
+    ///
+    /// See `docs/delegation-upgrade.md` for storage-compatibility rules that
+    /// must be observed between versions. Requires `initialize` to have been
+    /// called first; returns `NotInitialized` otherwise (fail-closed — there
+    /// is no admin to authorise the replace).
+    ///
+    /// Extends the instance storage TTL so an upgrade performed just before a
+    /// long quiet period does not leave storage at risk of expiry (T-21).
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), MuxDelegationError> {
+        Self::require_admin(&env)?;
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Self::extend_ttl(&env);
+        Ok(())
+    }
+
     /// Grant `permissions` from `owner` to `delegate`. Requires `owner` auth.
     ///
     /// If a prior grant exists for the same `(owner, delegate)` pair it is
@@ -325,6 +366,16 @@ impl MuxDelegation {
         env.storage()
             .instance()
             .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    fn require_admin(env: &Env) -> Result<(), MuxDelegationError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(MuxDelegationError::NotInitialized)?;
+        admin.require_auth();
+        Ok(())
     }
 
     /// Extend the TTL for a single persistent `DelegatePerms` or `OwnerDelegates`
@@ -776,6 +827,7 @@ mod tests {
         let _dlg_grant = symbol_short!("dlg_grant");
         let _dlg_rev = symbol_short!("dlg_rev");
         let _dlg_link = symbol_short!("dlg_link");
+        let _init = symbol_short!("init");
     }
 
     // ── check_delegate ────────────────────────────────────────────────────────
@@ -1039,5 +1091,95 @@ mod tests {
         // Prior delegation must be unaffected.
         assert!(client.is_delegate(&owner, &delegate, &perm));
         assert_eq!(client.get_delegates(&owner).len(), 1);
+    }
+
+    // ── initialize / upgrade (closes #693) ────────────────────────────────────
+
+    #[test]
+    fn test_initialize_stores_admin_and_emits_event() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+
+        assert!(client.try_initialize(&admin).is_ok());
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+        assert_eq!(topic_action(&env, &events, 0), symbol_short!("init"));
+    }
+
+    #[test]
+    fn test_double_initialize_fails() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin);
+        let result = client.try_initialize(&admin);
+        assert_eq!(result, Err(Ok(MuxDelegationError::AlreadyInitialized)));
+    }
+
+    #[test]
+    fn test_initialize_requires_admin_auth() {
+        // No mock_all_auths — require_auth must reject.
+        let env = Env::default();
+        let id = env.register_contract(None, MuxDelegation);
+        let client = MuxDelegationClient::new(&env, &id);
+        let admin = Address::generate(&env);
+
+        let result = client.try_initialize(&admin);
+        assert!(
+            result.is_err(),
+            "initialize must reject when admin auth is absent"
+        );
+    }
+
+    #[test]
+    fn test_upgrade_before_initialize_returns_not_initialized() {
+        let (env, client) = setup();
+        let fake_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+
+        let result = client.try_upgrade(&fake_hash);
+        assert_eq!(result, Err(Ok(MuxDelegationError::NotInitialized)));
+    }
+
+    #[test]
+    fn test_upgrade_requires_admin_auth() {
+        // Seed Admin directly in storage (bypassing initialize) so this test
+        // exercises only the upgrade() auth gate with zero mocked auths.
+        let env = Env::default();
+        let id = env.register_contract(None, MuxDelegation);
+        let client = MuxDelegationClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        env.as_contract(&id, || {
+            env.storage().instance().set(&DataKey::Admin, &admin);
+        });
+
+        let fake_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+        let result = client.try_upgrade(&fake_hash);
+        assert!(
+            result.is_err(),
+            "upgrade must reject when admin auth is absent"
+        );
+    }
+
+    #[test]
+    fn test_grant_delegate_does_not_require_initialize() {
+        // Delegation grants must keep working exactly as before for
+        // contracts that never call initialize() — the upgrade admin is
+        // optional and orthogonal to the delegation grant/revoke flow.
+        let (env, client) = setup();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let perms = vec![&env, symbol_short!("read")];
+
+        assert!(client.try_grant_delegate(&owner, &delegate, &perms).is_ok());
+    }
+
+    #[test]
+    fn test_error_code_not_initialized() {
+        assert_eq!(MuxDelegationError::NotInitialized as u32, 6006);
+    }
+
+    #[test]
+    fn test_error_code_already_initialized() {
+        assert_eq!(MuxDelegationError::AlreadyInitialized as u32, 6007);
     }
 }

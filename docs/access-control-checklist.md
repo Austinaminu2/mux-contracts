@@ -35,6 +35,8 @@ Legend:
 - [ ] `execute_batch` — `caller.require_auth()` called before any operations are dispatched.
 - [ ] `simulate_batch` — `caller.require_auth()` called (preflight is also auth-gated).
 - [ ] Batch operations are dispatched under the **caller's** auth context, not the batcher contract's.
+- [ ] `initialize` — `admin.require_auth()` called before storage write; optional (batching works without it).
+- [ ] `upgrade` — `require_admin` helper called; `NotInitialized` (fail-closed) if `initialize` was never called; no silent skip of the auth check.
 
 ### 1.3 `mux-permissions`
 
@@ -44,6 +46,8 @@ Legend:
 - [ ] `revoke_role` — `require_admin` helper called.
 - [ ] `has_permission`, `get_roles`, `get_role_members` — read-only; no auth required (acceptable).
 - [ ] No role mutation is possible without admin signature.
+- [ ] `upgrade` — `require_admin` helper called; WASM upgrade is admin-gated (same helper used by role and multisig-rotation entrypoints).
+- [ ] `propose_admin` / `approve_admin` — both fail-closed with no admin auth mocked at all (unit test: `test_admin_rotation_calls_require_admin_auth`); approvals below the configured threshold do not change the stored admin (unit test: `test_multisig_admin_promotion_transfers_control`).
 
 ### 1.4 `mux-policy`
 
@@ -69,6 +73,15 @@ Legend:
 - [ ] `cancel_recovery` — `require_owner` helper called; only current owner can cancel.
 - [ ] `execute_recovery` — `guardian.require_auth()` + `require_guardian` helper called.
 - [ ] No recovery mutation is possible without guardian or owner authorization.
+
+### 1.7 `mux-delegation`
+
+- [ ] `grant_delegate` — `owner.require_auth()` called before any storage write.
+- [ ] `revoke_delegate` — `owner.require_auth()` called before any storage write.
+- [ ] `link_contract_id` — the caller-supplied `admin` parameter authorizes **itself**; this is **not** checked against any stored admin identity, so it is not a privileged gate against other callers — see `docs/delegation-upgrade.md`.
+- [ ] `initialize` — `admin.require_auth()` called before storage write; optional (delegation grants work without it) and establishes a **separate** stored admin used only by `upgrade`.
+- [ ] `upgrade` — `require_admin` helper called; `NotInitialized` (fail-closed) if `initialize` was never called.
+- [ ] `get_delegate_permissions`, `is_delegate`, `get_delegates`, `check_delegate`, `get_contract_id` — read-only; no auth required (acceptable).
 
 ---
 
@@ -177,8 +190,9 @@ rg 'panic!|unreachable!|unimplemented!' contracts/*/src/lib.rs | grep -v '#\[cfg
 ## 8. Unit Test Coverage
 
 - [ ] `mux-account`: `initialize`, double-initialize, delegate CRUD, spend limit enforcement, invalid amount/period.
-- [ ] `mux-batcher`: empty batch, oversized batch.
-- [ ] `mux-permissions`: initialize, double-initialize, role create/grant/revoke, permission check, nonexistent role grant.
+- [ ] `mux-batcher`: empty batch, oversized batch, `initialize`/double-initialize/`upgrade` before `initialize`, `upgrade` auth rejection.
+- [ ] `mux-delegation`: grant/revoke CRUD, `initialize`/double-initialize/`upgrade` before `initialize`, `upgrade` auth rejection.
+- [ ] `mux-permissions`: initialize, double-initialize, role create/grant/revoke, permission check, nonexistent role grant, admin-threshold promotion (below-threshold no-op, at-threshold transfer), admin-rotation auth rejection, `upgrade` before `initialize`, `upgrade` auth rejection.
 - [ ] All `require_owner` / `require_admin` paths have a negative test (unauthorized caller).
 - [ ] All `AlreadyInitialized` paths have a test.
 - [ ] CI runs `cargo test --workspace --all-features` on every PR (see `.github/workflows/ci.yml`).

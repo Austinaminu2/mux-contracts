@@ -74,7 +74,7 @@ These caps prevent unbounded `Vec` growth in instance storage (STORAGE-GRIEFING 
 │  ┌───────────────────────────────────────────────────────────┐   │
 │  │  Can: create_role, grant_role, revoke_role,               │   │
 │  │        set_admin_threshold, propose_admin, approve_admin,  │   │
-│  │        set_metadata                                        │   │
+│  │        set_metadata, upgrade                                │   │
 │  └───────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
                                │
@@ -140,6 +140,15 @@ Admin transfer uses a threshold-based approval model:
 
 **Duplicate approval guard**: An approver cannot approve the same candidate twice
 (`AlreadyApproved` error).
+
+**Fail-closed enforcement**: `propose_admin` and `approve_admin` both call
+`require_admin()`, and `approve_admin` additionally requires the named
+`approver`'s own signature. With no auth mocked at all, both calls are
+rejected and pending-admin state is left unchanged — see
+`test_admin_rotation_calls_require_admin_auth` and
+`test_multisig_admin_promotion_transfers_control` in
+`contracts/mux-permissions/src/lib.rs`, which also asserts that the stored
+admin does not change until approvals reach the configured threshold.
 
 **Edge case — threshold = 1 (default)**: The proposing admin's own `approve_admin`
 call immediately promotes the candidate, making this behave like a single-key

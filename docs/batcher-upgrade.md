@@ -9,6 +9,23 @@ Soroban contracts are upgraded by uploading new WASM to the ledger and calling
 [docs/contract-upgrade-pattern.md](./contract-upgrade-pattern.md) for the
 general procedure.
 
+## Admin & Initialization
+
+`upgrade()` is admin-gated (`require_admin()` → `admin.require_auth()`), the
+same pattern used by `mux-policy`. Unlike `mux-policy`, the admin is
+**optional** for `mux-batcher`: batching (`execute_batch`, `submit_batch`,
+`simulate_batch`) never required an admin and still does not. The admin only
+exists to authorise `upgrade()`.
+
+- A batcher deployed and never `initialize`d has no `upgrade()` path —
+  calling `upgrade()` returns `NotInitialized`. This is fail-closed: there is
+  no admin to authorise a WASM replace, so none is possible.
+- Call `initialize(admin)` once, before the contract needs to be upgradeable,
+  to set the admin. A second call to `initialize` returns
+  `AlreadyInitialized`.
+- See [docs/upgrade-auth-requirements.md](upgrade-auth-requirements.md) for
+  the full auth flow and mainnet requirements (multisig admin, etc).
+
 ## Storage Layout
 
 `mux-batcher` uses **instance storage** only:
@@ -17,6 +34,7 @@ general procedure.
 |---|---|---|
 | `DataKey::Executing` | `bool` | Reentrancy guard — set to `true` after size checks pass in `execute_batch`; removed before the function returns on every path (success and `RequiredOperationFailed` abort). Never `true` at rest between transactions. |
 | `DataKey::Meta` | `BatcherMeta` | Optional deployment metadata (`description`, `author`) set once by `set_registry_metadata`. Never mutated after initial write. |
+| `DataKey::Admin` | `Address` | Optional upgrade authority, set once by `initialize`. Absent unless `initialize` was called — `upgrade()` returns `NotInitialized` in that case. Preserved across upgrades once set. |
 
 `DataKey::Executing` is set to `true` immediately after `EmptyBatch` and
 `BatchTooLarge` validation passes, and removed before the function returns
@@ -31,7 +49,10 @@ changes (see "Adding a New `DataKey` Variant" below).
 
 1. **Build and upload the new WASM** (see contract-upgrade-pattern.md).
 
-2. **Call `upgrade()`** on the live instance with the new WASM hash.
+2. **Call `upgrade()`** on the live instance with the new WASM hash. The
+   stored admin must authorise this call; if the instance was never
+   `initialize`d, call `initialize(admin)` first (see "Admin &
+   Initialization" above) — there is no other way to make it upgradeable.
 
 3. **Verify the contract is reachable** by calling `max_batch_size`:
    ```bash
@@ -58,9 +79,11 @@ that changes this constant.
 
 ### Changing Error Code Values
 
-`MuxBatcherError` discriminants (1–6) are part of the on-chain ABI. Clients
-that match on numeric codes must be updated if codes change. Coordinate any
-renumbering with a registry version bump and update `docs/error_codes.md`.
+`MuxBatcherError` discriminants (1–8, including `NotInitialized = 7` and
+`AlreadyInitialized = 8` added alongside `initialize`/`upgrade`) are part of
+the on-chain ABI. Clients that match on numeric codes must be updated if
+codes change. Coordinate any renumbering with a registry version bump and
+update `docs/error_codes.md`.
 
 ### Adding a New `DataKey` Variant
 
@@ -76,12 +99,13 @@ add a one-time migration function, call it in the same transaction as
 ## TTL Considerations
 
 Instance storage TTL is extended on every successful `execute_batch` call
-(`TTL_EXTEND_TO = 518_400` ledgers ≈ 30 days). An upgrade itself does **not**
-extend the TTL. If the contract is near expiry, call `execute_batch` (or any
-state-writing function) immediately after upgrading to reset the TTL.
+(`TTL_EXTEND_TO = 518_400` ledgers ≈ 30 days). `upgrade()` and `initialize()`
+also extend the TTL (T-21 mitigation) — an upgrade performed just before a
+long quiet period does not leave storage at risk of expiry on its own.
 
 ## Pre-Upgrade Checklist
 
+- [ ] Confirm the instance was `initialize`d (has a stored `DataKey::Admin`) — `upgrade()` returns `NotInitialized` otherwise
 - [ ] Verify new WASM hash with `scripts/verify-wasm-hash.sh`
 - [ ] Confirm `MAX_BATCH_SIZE` and `FEE_PER_OP` changes are intentional
 - [ ] Confirm `DataKey` enum is backward-compatible
@@ -93,4 +117,4 @@ state-writing function) immediately after upgrading to reset the TTL.
 
 Call `upgrade()` with the prior WASM hash. No storage migration is needed for
 rollback — `DataKey::Executing` is transient and is never persisted across
-transaction boundaries.
+transaction boundaries. `DataKey::Admin`, once set, is unaffected by rollback.

@@ -14,8 +14,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
-    Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    String, Symbol, Vec,
 };
 
 // ── Audit events ──────────────────────────────────────────────────────────────
@@ -119,6 +119,22 @@ impl MuxPermissions {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         emit(&env, symbol_short!("init"), admin);
+        Self::extend_ttl(&env);
+        Ok(())
+    }
+
+    /// Upgrade the contract WASM. Admin only.
+    ///
+    /// See `docs/permissions-upgrade-migration.md` for storage-compatibility
+    /// rules that must be observed between versions. Instance storage
+    /// (admin, roles, pending admin state) is preserved across upgrades by
+    /// the Soroban host — only the WASM code is replaced.
+    ///
+    /// Extends the instance storage TTL so an upgrade performed just before a
+    /// long quiet period does not leave storage at risk of expiry (T-21).
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), MuxPermissionsError> {
+        Self::require_admin(&env)?;
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
         Self::extend_ttl(&env);
         Ok(())
     }
@@ -546,6 +562,40 @@ mod tests {
         assert!(client.try_initialize(&admin).is_ok());
     }
 
+    // ── upgrade() (closes #692) ───────────────────────────────────────────────
+
+    #[test]
+    fn test_upgrade_requires_admin_auth() {
+        // Seed Admin directly in storage (bypassing initialize) so this test
+        // exercises only the upgrade() auth gate with zero mocked auths —
+        // require_admin() must reject before update_current_contract_wasm runs.
+        let env = Env::default();
+        let contract_id = env.register_contract(None, MuxPermissions);
+        let client = MuxPermissionsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            env.storage().instance().set(&DataKey::Admin, &admin);
+        });
+
+        let fake_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+        let result = client.try_upgrade(&fake_hash);
+        assert!(
+            result.is_err(),
+            "upgrade must reject when admin auth is absent"
+        );
+    }
+
+    #[test]
+    fn test_upgrade_before_initialize_returns_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, MuxPermissions);
+        let client = MuxPermissionsClient::new(&env, &contract_id);
+        let fake_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+        let result = client.try_upgrade(&fake_hash);
+        assert_eq!(result, Err(Ok(MuxPermissionsError::NotInitialized)));
+    }
+
     #[test]
     fn test_create_and_grant_role() {
         let (env, client, _admin) = setup();
@@ -717,7 +767,7 @@ mod tests {
 
     #[test]
     fn test_get_admin_threshold_after_set() {
-        let (env, client, _admin) = setup();
+        let (_env, client, _admin) = setup();
         client.set_admin_threshold(&3_u32);
         assert_eq!(client.get_admin_threshold(), 3_u32);
     }
@@ -970,35 +1020,44 @@ mod tests {
     }
 }
 
-// ── Integration test stubs ────────────────────────────────────────────────────
-// Issue #275 — Permissions: Add integration test stub.
+// ── Integration tests (closes #275, #691) ─────────────────────────────────────
 //
-// These stubs exercise multi-contract and cross-role scenarios that go beyond
-// isolated unit tests.  Each test is marked `#[ignore]` so that `cargo test`
-// runs them only when explicitly requested (`cargo test -- --ignored`), which
-// keeps the default CI fast while the stubs are fleshed out.
+// These exercise multi-contract and cross-role scenarios that go beyond
+// isolated unit tests. They previously ran only on `cargo test -- --ignored`;
+// they are now unconditional so CI catches regressions in admin-rotation
+// threshold enforcement (see docs/permissions-role-model.md).
 
 #[cfg(test)]
 mod integration_tests {
     use super::*;
     use soroban_sdk::{symbol_short, testutils::Address as _, Env, Vec};
 
-    fn setup_integration() -> (Env, MuxPermissionsClient<'static>, Address) {
+    fn setup_integration() -> (Env, MuxPermissionsClient<'static>, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, MuxPermissions);
         let client = MuxPermissionsClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         client.initialize(&admin);
-        (env, client, admin)
+        (env, client, admin, contract_id)
+    }
+
+    /// Read the currently stored admin directly from instance storage,
+    /// bypassing the public API (there is no `get_admin` entrypoint).
+    fn stored_admin(env: &Env, contract_id: &Address) -> Address {
+        env.as_contract(contract_id, || {
+            env.storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::Admin)
+                .unwrap()
+        })
     }
 
     /// Verify that a role granted on one instance is not visible on another
     /// (contracts are isolated — no global state bleed-through).
     #[test]
-    #[ignore = "integration stub: flesh out when multi-contract harness is ready"]
     fn test_permissions_isolated_across_contract_instances() {
-        let (env, client_a, _) = setup_integration();
+        let (env, client_a, _, _) = setup_integration();
         let contract_b = env.register_contract(None, MuxPermissions);
         let client_b = MuxPermissionsClient::new(&env, &contract_b);
         let admin_b = Address::generate(&env);
@@ -1017,9 +1076,8 @@ mod integration_tests {
     /// Full RBAC lifecycle: create role → grant → check permission → revoke →
     /// re-check. Simulates the sequence a real dApp would execute.
     #[test]
-    #[ignore = "integration stub: flesh out when multi-contract harness is ready"]
     fn test_full_rbac_lifecycle() {
-        let (env, client, _) = setup_integration();
+        let (env, client, _, _) = setup_integration();
         let user = Address::generate(&env);
         let role = symbol_short!("operator");
         let perm = symbol_short!("execute");
@@ -1034,12 +1092,12 @@ mod integration_tests {
         assert!(!client.has_permission(&user, &perm));
     }
 
-    /// Multisig admin promotion: two approvals required, then confirm the
-    /// promoted admin can create roles while the old admin cannot.
+    /// Multisig admin promotion: two approvals required. Below threshold the
+    /// stored admin must not change; once the threshold is reached, the
+    /// stored admin must flip to the candidate and be removed from pending.
     #[test]
-    #[ignore = "integration stub: flesh out when multi-contract harness is ready"]
     fn test_multisig_admin_promotion_transfers_control() {
-        let (env, client, old_admin) = setup_integration();
+        let (env, client, old_admin, contract_id) = setup_integration();
         client.set_admin_threshold(&2_u32);
         let new_admin = Address::generate(&env);
         let second_approver = Address::generate(&env);
@@ -1050,14 +1108,62 @@ mod integration_tests {
         client.grant_role(&second_approver, &admin_role);
 
         client.propose_admin(&new_admin);
-        client.approve_admin(&old_admin, &new_admin);
-        client.approve_admin(&second_approver, &new_admin);
 
-        // new_admin should now be the active admin; verify by creating a role.
-        let role = symbol_short!("newrole");
-        client.create_role(&role, &Vec::new(&env));
-        let members = client.get_role_members(&role);
-        assert_eq!(members.len(), 0);
+        // First approval: below threshold (1 < 2) — admin must NOT change yet.
+        client.approve_admin(&old_admin, &new_admin);
+        assert_eq!(
+            stored_admin(&env, &contract_id),
+            old_admin,
+            "admin must remain unchanged below the approval threshold"
+        );
+        assert!(
+            client.get_pending_admins().contains(&new_admin),
+            "candidate must remain pending below the approval threshold"
+        );
+
+        // Second approval reaches the threshold — promotion happens now.
+        client.approve_admin(&second_approver, &new_admin);
+        assert_eq!(
+            stored_admin(&env, &contract_id),
+            new_admin,
+            "admin must be promoted once approvals reach the threshold"
+        );
+        assert!(
+            !client.get_pending_admins().contains(&new_admin),
+            "promoted candidate must be removed from the pending list"
+        );
+    }
+
+    /// propose_admin and approve_admin must be fail-closed: with no admin
+    /// auth mocked at all, both calls must be rejected and must not mutate
+    /// pending-admin state. Admin state is seeded directly in storage so the
+    /// test isolates the auth gate from `initialize`'s own auth requirement.
+    #[test]
+    fn test_admin_rotation_calls_require_admin_auth() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, MuxPermissions);
+        let client = MuxPermissionsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let candidate = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            env.storage().instance().set(&DataKey::Admin, &admin);
+        });
+
+        let propose_result = client.try_propose_admin(&candidate);
+        assert!(
+            propose_result.is_err(),
+            "propose_admin must reject when admin auth is absent"
+        );
+        assert!(
+            client.get_pending_admins().is_empty(),
+            "no candidate must be recorded after a rejected propose_admin"
+        );
+
+        let approve_result = client.try_approve_admin(&admin, &candidate);
+        assert!(
+            approve_result.is_err(),
+            "approve_admin must reject when admin auth is absent"
+        );
     }
 
     // ── symbol_short length audit (#496) ─────────────────────────────────────

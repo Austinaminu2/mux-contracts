@@ -23,6 +23,7 @@ general procedure.
 | `DataKey::PendingAdmins` | `Vec<Address>` | Pending multisig candidates |
 | `DataKey::AdminThreshold` | `u32` | Required approval count |
 | `DataKey::AdminApprovals(Address)` | `Vec<Address>` | Approvals per candidate |
+| `DataKey::Metadata` | `RegistryMeta` | Optional registry metadata |
 
 **Instance storage is preserved across WASM upgrades** — existing roles,
 members, and the current admin are not affected by the upgrade itself.
@@ -76,6 +77,6 @@ still be completed after the upgrade.
 ## TTL Considerations
 
 Instance storage TTL is extended on every write (`TTL_EXTEND_TO = 518_400`
-ledgers ≈ 30 days). An upgrade does **not** automatically extend the TTL.
-If the contract is close to expiry, call any write function (e.g.,
-`set_admin_threshold`) immediately after upgrading to reset the TTL.
+ledgers ≈ 30 days), including `upgrade()` itself (T-21 mitigation) — an
+upgrade performed just before a long quiet period does not leave storage at
+risk of expiry on its own.

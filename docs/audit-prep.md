@@ -158,7 +158,7 @@ These items are known before the audit and are documented here so auditors can f
 | L-02 | Guardian recovery (`guardians` field) is stored but no recovery flow is implemented. The guardian set is a placeholder for a future M-of-N recovery mechanism. | Acknowledged; out of scope for v0.1 |
 | L-03 | `simulate_batch` returns a conservative estimate (all ops succeed) without actually invoking targets. It does not detect auth failures or contract errors in advance. | By design; documented in code |
 | L-04 | `mux-batcher` does not validate that target contracts are non-malicious. Callers are responsible for vetting targets. | By design; documented in threat model T-10 |
-| L-05 | No upgrade mechanism exists. Contracts are immutable once deployed. A compromised or buggy contract requires redeployment and migration. | Acknowledged; upgrade governance is future roadmap |
+| L-05 | Most contracts have no upgrade mechanism (`mux-account`, `mux-account-factory`, `mux-recovery`, `mux-registry`, `mux-spending-policy`, `mux-wallet-registry`) and require redeployment + migration for a fix. `mux-policy` has a mandatory admin-gated `upgrade()`. `mux-batcher`, `mux-delegation`, and `mux-permissions` have an admin-gated `upgrade()` that is a no-op (`NotInitialized`) unless the deploying team opts in — see [mainnet-immutable-flag-guidance.md](mainnet-immutable-flag-guidance.md). | Acknowledged; opt-in upgrade path added for the three contracts named above, immutable-by-default posture otherwise |
 | L-06 | `SpendLimit` keys are unbounded in count (one per asset). Only the owner can write them, so the attack surface is limited to a self-griefing owner. | Acknowledged; see threat model T-20 |
 
 ---

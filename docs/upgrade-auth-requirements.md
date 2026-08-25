@@ -30,10 +30,10 @@ This document defines the authentication requirements for upgrading Mux Protocol
 |----------|----------------|--------------|-------|
 | `mux-account` | Not yet | N/A (immutable) | Deployment is currently immutable; upgrade path documented but entry point not exposed |
 | `mux-account-factory` | Not yet | N/A (immutable) | No on-chain upgrade entry point |
-| `mux-batcher` | Not yet | N/A (immutable) | Consider adding before mainnet if batch semantics need evolution |
-| `mux-delegation` | Not yet | N/A (immutable) | See [delegation-upgrade.md](delegation-upgrade.md) |
-| `mux-permissions` | Not yet | N/A (immutable) | See [permissions-upgrade-migration.md](permissions-upgrade-migration.md) |
-| `mux-policy` | **Yes** | `require_admin()` → `require_auth()` | Only contract with live `upgrade()` entry point |
+| `mux-batcher` | **Yes** | `require_admin()` → `require_auth()` | Admin is optional — set via `initialize(admin)`; a batcher never initialized has no `upgrade()` path (`NotInitialized`). Batching itself never required an admin. See [batcher-upgrade.md](batcher-upgrade.md) |
+| `mux-delegation` | **Yes** | `require_admin()` → `require_auth()` | Admin is optional — set via `initialize(admin)`; independent of the caller-supplied `admin` param on `link_contract_id`. See [delegation-upgrade.md](delegation-upgrade.md) |
+| `mux-permissions` | **Yes** | `require_admin()` → `require_auth()` | Reuses the same `DataKey::Admin` / `require_admin()` used by role and multisig-rotation entrypoints. See [permissions-upgrade-migration.md](permissions-upgrade-migration.md) |
+| `mux-policy` | **Yes** | `require_admin()` → `require_auth()` | Admin is set at `initialize()` time (mandatory) |
 | `mux-recovery` | Not yet | N/A (immutable) | Recovery timelock is time-critical; upgrade path requires careful design |
 | `mux-registry` | Not yet | N/A (immutable) | See [contract-upgrade-pattern.md](contract-upgrade-pattern.md) |
 | `mux-spending-policy` | Not yet | N/A (immutable) | No on-chain upgrade entry point |

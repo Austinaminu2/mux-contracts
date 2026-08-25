@@ -46,6 +46,8 @@ Errors are defined in `MuxBatcherError` (`contracts/mux-batcher/src/lib.rs`).
 | `Unauthorized` | 4 | 401 | `require_auth()` failed for the caller |
 | `ReentrancyDetected` | 5 | 409 | A reentrant call into the batcher was detected |
 | `MetadataAlreadySet` | 6 | 409 | Metadata has already been set for this batch |
+| `NotInitialized` | 7 | 500 | `upgrade` called before `initialize`; no admin to authorise it |
+| `AlreadyInitialized` | 8 | 409 | `initialize` called more than once |
 
 ## Mux Delegation (`contracts/mux-delegation`)
 
@@ -59,6 +61,9 @@ Note: This contract uses a non-sequential numbering scheme starting at 6001.
 | `TooManyPermissions` | 6002 | 400 | Permission list exceeds the allowed maximum |
 | `EmptyPermissions` | 6003 | 400 | An empty permission list was provided |
 | `TooManyDelegates` | 6004 | 409 | Delegate list has reached capacity |
+| `ContractIdAlreadySet` | 6005 | 409 | `link_contract_id` called more than once |
+| `NotInitialized` | 6006 | 500 | `upgrade` called before `initialize`; no admin to authorise it |
+| `AlreadyInitialized` | 6007 | 409 | `initialize` called more than once |
 
 ## Mux Permissions (`contracts/mux-permissions`)
 

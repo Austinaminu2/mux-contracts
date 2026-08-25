@@ -13,8 +13,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, Env, String,
-    Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN,
+    Env, String, Vec,
 };
 
 // ── Batch operation kind ──────────────────────────────────────────────────────
@@ -55,6 +55,9 @@ enum DataKey {
     Executing,
     /// Stores optional contract-level metadata set once at deployment.
     Meta,
+    /// Upgrade authority, set once by `initialize`. Optional: a batcher that
+    /// is never initialized has no admin and can never be upgraded.
+    Admin,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -109,6 +112,8 @@ pub enum MuxBatcherError {
     Unauthorized = 4,
     ReentrancyDetected = 5,
     MetadataAlreadySet = 6,
+    NotInitialized = 7,
+    AlreadyInitialized = 8,
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -160,6 +165,42 @@ pub struct MuxBatcher;
 
 #[contractimpl]
 impl MuxBatcher {
+    /// Initialize the batcher with an upgrade admin. Optional: a batcher
+    /// that is never initialized behaves exactly as before this admin was
+    /// introduced — it simply has no `upgrade()` path (`upgrade` returns
+    /// `NotInitialized`). Batching itself never required an admin and still
+    /// does not.
+    pub fn initialize(env: Env, admin: Address) -> Result<(), MuxBatcherError> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(MuxBatcherError::AlreadyInitialized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        emit(&env, symbol_short!("init"), admin);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        Ok(())
+    }
+
+    /// Upgrade the contract WASM. Admin only.
+    ///
+    /// See `docs/batcher-upgrade.md` for storage-compatibility rules that
+    /// must be observed between versions. Requires `initialize` to have been
+    /// called first; returns `NotInitialized` otherwise (fail-closed — there
+    /// is no admin to authorise the replace).
+    ///
+    /// Extends the instance storage TTL so an upgrade performed just before a
+    /// long quiet period does not leave storage at risk of expiry (T-21).
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), MuxBatcherError> {
+        Self::require_admin(&env)?;
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+        Ok(())
+    }
+
     /// Execute a batch of operations atomically.
     ///
     /// If any operation has `require_success = true` and fails, returns
@@ -373,6 +414,18 @@ impl MuxBatcher {
         );
 
         Ok(result)
+    }
+
+    // ── Private helpers ────────────────────────────────────────────────────────
+
+    fn require_admin(env: &Env) -> Result<(), MuxBatcherError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(MuxBatcherError::NotInitialized)?;
+        admin.require_auth();
+        Ok(())
     }
 }
 
@@ -599,8 +652,6 @@ mod tests {
         // Note: the Soroban test environment does not support true recursive
         // cross-contract re-entry within a single test frame, so we seed the flag
         // directly to exercise the guard check in isolation.
-        use soroban_sdk::testutils::storage::Instance as _;
-
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, MuxBatcher);
@@ -1294,9 +1345,107 @@ mod tests {
             symbol_short!("bat_ok"),
             symbol_short!("bat_abort"),
             symbol_short!("sim_done"),
+            symbol_short!("init"),
         ];
         for sym in tags.iter().chain(actions.iter()) {
             let _ = sym;
         }
+    }
+
+    // ── initialize / upgrade (closes #694) ────────────────────────────────────
+
+    #[test]
+    fn test_initialize_stores_admin_and_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, MuxBatcher);
+        let client = MuxBatcherClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        assert!(client.try_initialize(&admin).is_ok());
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+        assert_eq!(topic_action(&env, &events, 0), symbol_short!("init"));
+    }
+
+    #[test]
+    fn test_double_initialize_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, MuxBatcher);
+        let client = MuxBatcherClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin);
+        let result = client.try_initialize(&admin);
+        assert_eq!(result, Err(Ok(MuxBatcherError::AlreadyInitialized)));
+    }
+
+    #[test]
+    fn test_initialize_requires_admin_auth() {
+        // No mock_all_auths — require_auth must reject.
+        let env = Env::default();
+        let contract_id = env.register_contract(None, MuxBatcher);
+        let client = MuxBatcherClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        let result = client.try_initialize(&admin);
+        assert!(
+            result.is_err(),
+            "initialize must reject when admin auth is absent"
+        );
+    }
+
+    #[test]
+    fn test_upgrade_before_initialize_returns_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, MuxBatcher);
+        let client = MuxBatcherClient::new(&env, &contract_id);
+        let fake_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+
+        let result = client.try_upgrade(&fake_hash);
+        assert_eq!(result, Err(Ok(MuxBatcherError::NotInitialized)));
+    }
+
+    #[test]
+    fn test_upgrade_requires_admin_auth() {
+        // Seed Admin directly in storage (bypassing initialize) so this test
+        // exercises only the upgrade() auth gate with zero mocked auths.
+        let env = Env::default();
+        let contract_id = env.register_contract(None, MuxBatcher);
+        let client = MuxBatcherClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            env.storage().instance().set(&DataKey::Admin, &admin);
+        });
+
+        let fake_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+        let result = client.try_upgrade(&fake_hash);
+        assert!(
+            result.is_err(),
+            "upgrade must reject when admin auth is absent"
+        );
+    }
+
+    #[test]
+    fn test_execute_batch_does_not_require_initialize() {
+        // Batching must keep working exactly as before for batchers that
+        // never call initialize() — the admin is optional and orthogonal to
+        // batch execution.
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, MuxBatcher);
+        let client = MuxBatcherClient::new(&env, &contract_id);
+        let caller = Address::generate(&env);
+        let mut ops: Vec<Operation> = Vec::new(&env);
+        ops.push_back(Operation {
+            target: Address::generate(&env),
+            fn_name: symbol_short!("noop"),
+            args: Vec::new(&env),
+            require_success: false,
+            kind: BatchOperationKind::Invoke,
+        });
+        assert!(client.try_execute_batch(&caller, &ops).is_ok());
     }
 }

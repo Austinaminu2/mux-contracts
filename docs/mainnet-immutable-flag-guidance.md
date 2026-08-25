@@ -20,8 +20,23 @@ On Soroban, contracts are **immutable by default** — WASM bytecode cannot be c
 | Immutability level | Meaning | When to use |
 |--------------------|---------|-------------|
 | **Fully immutable** | No `upgrade()` function; contract code can never change | Core contracts with stable interfaces, audited and battle-tested |
-| **Conditionally upgradeable** | `upgrade()` exists, gated by admin auth | Contracts where feature evolution is expected (e.g., policy rules) |
+| **Opt-in upgradeable** | `upgrade()` exists but is gated by an admin that only exists if `initialize()` was called; never calling `initialize()` leaves the deployment exactly as immutable as "fully immutable" | Contracts whose interface is stable today but where the deploying team wants the *option* to react to an audit finding without a full redeploy + state migration (mux-batcher, mux-delegation, mux-permissions) |
+| **Conditionally upgradeable** | `upgrade()` exists, gated by a **mandatory** admin set at `initialize()` time | Contracts where feature evolution is expected (e.g., policy rules) |
 | **Proxied / replaceable** | Contract delegates to an implementation contract that can be swapped | Complex systems needing hot-swap without state migration |
+
+**Opt-in vs. conditionally upgradeable — the difference that matters:** both
+have a live `upgrade()` function in the deployed WASM. The distinction is
+whether the admin gating it is guaranteed to exist. `mux-policy`'s
+`initialize()` is mandatory — every deployment has an admin from the first
+transaction, so `mux-policy` is upgradeable from day one. `mux-batcher`,
+`mux-delegation`, and `mux-permissions`'s admin comes from a *separate,
+optional* `initialize()` call — a deployment that never calls it has no
+`DataKey::Admin`, so `upgrade()` unconditionally returns `NotInitialized`
+and the deployment is immutable in exactly the sense Option A below
+describes. The immutability guarantee is a **deploy-time operational
+choice** (call `initialize()` or don't), not a property you can read off the
+WASM alone — see "Verification" below for how to confirm which choice a
+given deployment made.
 
 ---
 
@@ -31,27 +46,53 @@ On Soroban, contracts are **immutable by default** — WASM bytecode cannot be c
 |----------|-------------|-----------|
 | `mux-account` | **No** | Core AA logic; immutability is a user trust guarantee |
 | `mux-account-factory` | **No** | Factory registration logic is stable; no evolution expected |
-| `mux-batcher` | **No** | Atomic batching semantics are fixed by protocol design |
-| `mux-delegation` | **No** | Delegate permission model is audited and stable |
-| `mux-permissions` | **No** | RBAC registry with stable interface |
-| `mux-policy` | **Yes** | Policy rules may evolve; admin-gated `upgrade()` exposed |
+| `mux-batcher` | **Opt-in** (immutable unless `initialize()` is called) | Atomic batching semantics are fixed by protocol design — the deploying team is not expected to call `initialize()` on mainnet, but the escape hatch exists. See [batcher-upgrade.md](batcher-upgrade.md). |
+| `mux-delegation` | **Opt-in** (immutable unless `initialize()` is called) | Delegate permission model is audited and stable — same opt-in rationale as `mux-batcher`. See [delegation-upgrade.md](delegation-upgrade.md). |
+| `mux-permissions` | **Opt-in for `upgrade()` specifically** — `initialize()` is mandatory for RBAC to function at all, but calling `upgrade()` is a separate, later choice by whoever holds the admin key | RBAC registry with a stable interface today; the admin already required for role management can also authorise a WASM replace if ever needed. See [permissions-upgrade-migration.md](permissions-upgrade-migration.md). |
+| `mux-policy` | **Yes** | Policy rules may evolve; admin-gated `upgrade()` exposed, admin is mandatory from `initialize()` |
 | `mux-recovery` | **No** | Recovery timelock is time-critical; upgrade path requires careful design |
 | `mux-registry` | **No** | Version registry with stable interface |
 | `mux-spending-policy` | **No** | Spend limit logic is stable |
 | `mux-wallet-registry` | **No** | Wallet registration is stable |
 
+**Mainnet deployment guidance for the three opt-in contracts:** to deploy
+`mux-batcher` or `mux-delegation` as *fully* immutable (matching the
+"Atomic batching semantics are fixed" / "audited and stable" rationale
+above), simply never call `initialize()` — do not do this by accident, since
+there is no way to un-set an admin once one is set (no
+`renounce_upgrade_authority()` exists for these three; see Option C below if
+that guarantee is needed). `mux-permissions` always has an admin (mandatory
+for RBAC), so its immutability decision reduces to: does the team intend to
+ever call `upgrade()`? Document that decision explicitly in the deploy
+runbook and record it in the "Immutability registry" below regardless of
+which way it goes.
+
 ---
 
 ## Making a contract immutable on mainnet
 
-### Option A: Do not expose `upgrade()` (recommended for most contracts)
+### Option A: Do not expose `upgrade()` (strongest guarantee)
 
-Simply omit the `upgrade()` function from the contract. Without it, there is no on-chain mechanism to replace the WASM. The contract is immutable from the moment it is deployed.
+Simply omit the `upgrade()` function from the contract. Without it, there is no on-chain mechanism to replace the WASM. The contract is immutable from the moment it is deployed. This is how `mux-account`, `mux-account-factory`, `mux-recovery`, `mux-registry`, `mux-spending-policy`, and `mux-wallet-registry` remain immutable — they have no `upgrade()` in the ABI at all.
 
 ```rust
 // No upgrade() function means no way to change the code.
 // This is the strongest immutability guarantee.
 ```
+
+### Option A′: Never call the optional `initialize()` (mux-batcher, mux-delegation)
+
+`mux-batcher` and `mux-delegation` ship with `upgrade()` in the ABI, but it
+is gated by an admin that is only ever set by a separate, optional
+`initialize(admin)` call. If mainnet deployment never calls `initialize()`,
+`upgrade()` unconditionally returns `NotInitialized` — there is no admin to
+authorise it, so the deployment is immutable in practice even though
+`upgrade()` is present in the WASM. This is weaker than Option A only in
+that the escape hatch exists in the deployed code; it is equivalent in that
+no one can actually invoke it without first getting an `initialize()`
+transaction signed and submitted, which is itself an auditable on-chain
+event. Prefer this over Option B when the team wants to preserve the option
+to upgrade later without a redeploy.
 
 ### Option B: Remove `upgrade()` before mainnet deploy
 
@@ -115,8 +156,9 @@ pub fn renounce_upgrade_authority(env: Env) -> Result<(), ContractError> {
 | Factory / registry (mux-account-factory, mux-registry) | **Immutable** — registration logic is stable |
 | Policy / spending (mux-policy) | **Conditionally upgradeable** — rules may evolve with governance |
 | Recovery (mux-recovery) | **Immutable** — timelock logic is security-critical |
-| Permissions (mux-permissions) | **Immutable** — RBAC is audited and stable |
-| Batcher (mux-batcher) | **Immutable** — atomic batching semantics are fixed |
+| Permissions (mux-permissions) | **Immutable in practice** — `upgrade()` exists (admin is mandatory for RBAC), but the recommendation is to never call it absent an audit finding |
+| Batcher (mux-batcher) | **Immutable by default** — do not call `initialize()` on mainnet unless the upgrade escape hatch is deliberately wanted |
+| Delegation (mux-delegation) | **Immutable by default** — do not call `initialize()` on mainnet unless the upgrade escape hatch is deliberately wanted |
 
 ---
 
@@ -126,7 +168,12 @@ After deploying an immutable contract on mainnet:
 
 1. Record the WASM hash in `CONTRACT_IDS.md`
 2. Verify the hash matches the built WASM: `scripts/verify-wasm-hash.sh`
-3. Confirm no `upgrade()` function exists in the contract ABI
+3. Confirm no `upgrade()` function exists in the contract ABI — for
+   `mux-batcher` and `mux-delegation`, `upgrade()` exists in the ABI by
+   design (see Option A′ above), so instead confirm `initialize()` was never
+   called: `get_registry_metadata()` / equivalent read calls succeeding is
+   not sufficient evidence; check that an `init` event was never emitted for
+   the deployed contract ID via `getEvents`
 4. Document the immutability decision in release notes
 5. Add the contract to the immutability registry below
 
